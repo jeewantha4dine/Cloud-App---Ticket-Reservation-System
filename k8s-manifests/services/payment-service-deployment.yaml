@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: default
+  labels:
+    app: payment-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+    spec:
+      containers:
+      - name: payment-service
+        image: payment-service:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 3004
+        env:
+        - name: DB_HOST
+          value: mysql-service
+        - name: DB_USER
+          value: ticketuser
+        - name: DB_PASSWORD
+          value: ticketpassword
+        - name: DB_NAME
+          value: ticket_booking
+        - name: RABBITMQ_URL
+          value: amqp://admin:password@rabbitmq-service:5672
+        resources:
+          limits:
+            memory: "256Mi"
+            cpu: "250m"
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: default
+spec:
+  selector:
+    app: payment-service
+  ports:
+  - port: 80
+    targetPort: 3004
+  type: ClusterIP
