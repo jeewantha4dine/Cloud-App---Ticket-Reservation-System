@@ -17,8 +17,8 @@ app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 100
 });
 app.use('/api/', limiter);
 
@@ -29,12 +29,23 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD || 'ticketpassword',
   database: process.env.DB_NAME || 'ticket_booking',
   connectionLimit: 10,
-  waitForConnections: true,
-  queueLimit: 0
+  acquireTimeout: 60000,
+  timeout: 60000,
+  reconnect: true
 });
 
 // JWT secret
 const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-in-production';
+
+// Metrics tracking
+let metrics = {
+  http_requests_total: 0,
+  http_errors_total: 0,
+  user_registrations_total: 0,
+  user_logins_total: 0,
+  active_sessions: 0,
+  start_time: Date.now()
+};
 
 // Middleware to verify JWT token
 const verifyToken = (req, res, next) => {
@@ -53,7 +64,32 @@ const verifyToken = (req, res, next) => {
   }
 };
 
-// Health check endpoint
+// Middleware to track requests
+app.use((req, res, next) => {
+  metrics.http_requests_total++;
+  
+  if (req.path === '/api/register' && req.method === 'POST') {
+    metrics.user_registrations_total++;
+  }
+  if (req.path === '/api/login' && req.method === 'POST') {
+    metrics.user_logins_total++;
+  }
+  
+  const originalSend = res.send;
+  res.send = function(data) {
+    if (res.statusCode >= 400) {
+      metrics.http_errors_total++;
+    }
+    if (req.path === '/api/login' && res.statusCode === 200) {
+      metrics.active_sessions++;
+    }
+    return originalSend.call(this, data);
+  };
+  
+  next();
+});
+
+// Health check endpoints
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'healthy', service: 'user-service' });
 });
@@ -69,39 +105,62 @@ app.get('/ready', async (req, res) => {
   }
 });
 
+// Metrics endpoint
+app.get('/metrics', (req, res) => {
+  const uptime = (Date.now() - metrics.start_time) / 1000;
+  const memUsage = process.memoryUsage();
+  
+  const metricsText = `# HELP http_requests_total Total HTTP requests
+# TYPE http_requests_total counter
+http_requests_total{service="user-service"} ${metrics.http_requests_total}
+
+# HELP http_errors_total Total HTTP errors
+# TYPE http_errors_total counter
+http_errors_total{service="user-service"} ${metrics.http_errors_total}
+
+# HELP user_registrations_total Total user registrations
+# TYPE user_registrations_total counter
+user_registrations_total{service="user-service"} ${metrics.user_registrations_total}
+
+# HELP user_logins_total Total user logins
+# TYPE user_logins_total counter
+user_logins_total{service="user-service"} ${metrics.user_logins_total}
+
+# HELP active_sessions Current active sessions
+# TYPE active_sessions gauge
+active_sessions{service="user-service"} ${metrics.active_sessions}
+
+# HELP service_uptime_seconds Service uptime
+# TYPE service_uptime_seconds gauge
+service_uptime_seconds{service="user-service"} ${uptime}
+
+# HELP nodejs_memory_usage_bytes Memory usage
+# TYPE nodejs_memory_usage_bytes gauge
+nodejs_memory_usage_bytes{service="user-service",type="rss"} ${memUsage.rss}
+nodejs_memory_usage_bytes{service="user-service",type="heapUsed"} ${memUsage.heapUsed}
+nodejs_memory_usage_bytes{service="user-service",type="heapTotal"} ${memUsage.heapTotal}
+`;
+  
+  res.set('Content-Type', 'text/plain');
+  res.send(metricsText);
+});
+
 // User registration
 app.post('/api/register', async (req, res) => {
   try {
     const { email, password, firstName, lastName, phone } = req.body;
     
-    // Validate input
     if (!email || !password || !firstName || !lastName) {
-      return res.status(400).json({ error: 'Missing required fields: email, password, firstName, lastName' });
+      return res.status(400).json({ error: 'Missing required fields' });
     }
     
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ error: 'Invalid email format' });
-    }
-    
-    // Validate password strength
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters long' });
-    }
-    
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
-    
-    // Handle undefined phone - convert to null for MySQL
-    const phoneValue = phone || null;
     
     const [result] = await pool.execute(
       'INSERT INTO users (email, password, first_name, last_name, phone, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
-      [email, hashedPassword, firstName, lastName, phoneValue]
+      [email, hashedPassword, firstName, lastName, phone]
     );
     
-    // Generate JWT token
     const token = jwt.sign(
       { userId: result.insertId, email },
       JWT_SECRET,
@@ -111,20 +170,14 @@ app.post('/api/register', async (req, res) => {
     res.status(201).json({ 
       message: 'User created successfully', 
       userId: result.insertId,
-      token,
-      user: {
-        id: result.insertId,
-        email,
-        firstName,
-        lastName
-      }
+      token 
     });
   } catch (error) {
     if (error.code === 'ER_DUP_ENTRY') {
       return res.status(400).json({ error: 'Email already exists' });
     }
     console.error('Registration error:', error);
-    res.status(500).json({ error: 'Registration failed', details: error.message });
+    res.status(500).json({ error: 'Registration failed' });
   }
 });
 
@@ -205,26 +258,13 @@ app.put('/api/profile', verifyToken, async (req, res) => {
     
     await pool.execute(
       'UPDATE users SET first_name = ?, last_name = ?, phone = ?, updated_at = NOW() WHERE id = ?',
-      [firstName, lastName, phone || null, req.user.userId]
+      [firstName, lastName, phone, req.user.userId]
     );
     
     res.json({ message: 'Profile updated successfully' });
   } catch (error) {
     console.error('Update profile error:', error);
     res.status(500).json({ error: 'Failed to update profile' });
-  }
-});
-
-// Get all users (admin endpoint for testing)
-app.get('/api/users', async (req, res) => {
-  try {
-    const [users] = await pool.execute(
-      'SELECT id, email, first_name, last_name, phone, status, created_at FROM users ORDER BY created_at DESC LIMIT 10'
-    );
-    res.json({ users });
-  } catch (error) {
-    console.error('Get users error:', error);
-    res.status(500).json({ error: 'Failed to fetch users' });
   }
 });
 

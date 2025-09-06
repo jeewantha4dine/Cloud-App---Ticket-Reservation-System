@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-exporter
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-exporter
+  template:
+    metadata:
+      labels:
+        app: mysql-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9104"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: mysql-exporter
+        image: prom/mysqld-exporter:latest
+        ports:
+        - containerPort: 9104
+        env:
+        - name: DATA_SOURCE_NAME
+          value: "ticketuser:ticketpassword@(mysql-service:3306)/ticket_booking"
+        resources:
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-exporter
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9104"
+spec:
+  selector:
+    app: mysql-exporter
+  ports:
+  - port: 9104
+    targetPort: 9104

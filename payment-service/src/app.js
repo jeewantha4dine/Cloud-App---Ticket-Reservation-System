@@ -240,3 +240,58 @@ process.on('SIGTERM', async () => {
   await pool.end();
   process.exit(0);
 });
+
+// Payment service metrics
+let paymentMetrics = {
+  http_requests_total: 0,
+  payments_processed_total: 0,
+  payments_successful_total: 0,
+  payments_failed_total: 0,
+  total_revenue: 0,
+  start_time: Date.now()
+};
+
+// Middleware for metrics
+app.use((req, res, next) => {
+  paymentMetrics.http_requests_total++;
+  next();
+});
+
+// Metrics endpoint
+app.get('/metrics', (req, res) => {
+  const uptime = (Date.now() - paymentMetrics.start_time) / 1000;
+  const memUsage = process.memoryUsage();
+  
+  const metricsText = `# HELP http_requests_total Total HTTP requests
+# TYPE http_requests_total counter
+http_requests_total{service="payment-service"} ${paymentMetrics.http_requests_total}
+
+# HELP payments_processed_total Total payments processed
+# TYPE payments_processed_total counter
+payments_processed_total{service="payment-service"} ${paymentMetrics.payments_processed_total}
+
+# HELP payments_successful_total Total successful payments
+# TYPE payments_successful_total counter
+payments_successful_total{service="payment-service"} ${paymentMetrics.payments_successful_total}
+
+# HELP payments_failed_total Total failed payments
+# TYPE payments_failed_total counter
+payments_failed_total{service="payment-service"} ${paymentMetrics.payments_failed_total}
+
+# HELP total_revenue Total revenue processed
+# TYPE total_revenue gauge
+total_revenue{service="payment-service"} ${paymentMetrics.total_revenue}
+
+# HELP service_uptime_seconds Service uptime
+# TYPE service_uptime_seconds gauge
+service_uptime_seconds{service="payment-service"} ${uptime}
+
+# HELP nodejs_memory_usage_bytes Memory usage
+# TYPE nodejs_memory_usage_bytes gauge
+nodejs_memory_usage_bytes{service="payment-service",type="rss"} ${memUsage.rss}
+nodejs_memory_usage_bytes{service="payment-service",type="heapUsed"} ${memUsage.heapUsed}
+`;
+  
+  res.set('Content-Type', 'text/plain');
+  res.send(metricsText);
+});

@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Frontend for ticket booking system",
   "scripts": {
-    "start": "npx serve build -s -l 3000",
+    "start": "npx serve public -s -l 3000",
     "build": "echo 'Build completed'",
     "dev": "npx serve public -l 3000"
   },

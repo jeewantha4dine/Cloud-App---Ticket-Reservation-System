@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-exporter-secret
+type: Opaque
+stringData:
+  datasource: "ticketuser:ticketpassword@tcp(mysql-service:3306)/ticket_booking"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-exporter
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-exporter
+  template:
+    metadata:
+      labels:
+        app: mysql-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9104"
+    spec:
+      containers:
+      - name: mysql-exporter
+        image: prom/mysqld-exporter:v0.14.0
+        ports:
+        - containerPort: 9104
+        env:
+        - name: DATA_SOURCE_NAME
+          valueFrom:
+            secretKeyRef:
+              name: mysql-exporter-secret
+              key: datasource
+        args:
+          - --collect.info_schema.processlist
+          - --collect.info_schema.innodb_metrics
+          - --collect.info_schema.query_response_time
+          - --collect.info_schema.userstats
+          - --collect.info_schema.tables
+          - --collect.perf_schema.tablelocks
+          - --collect.perf_schema.file_events
+          - --collect.perf_schema.eventswaits
+          - --collect.auto_increment.columns
+          - --collect.binlog_size
+          - --collect.perf_schema.tableiowaits
+          - --collect.perf_schema.indexiowaits
+        resources:
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-exporter
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9104"
+spec:
+  selector:
+    app: mysql-exporter
+  ports:
+  - port: 9104
+    targetPort: 9104
