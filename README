@@ -1,0 +1,621 @@
+# Steps to Run the Application
+
+## 1. Update System
+
+```bash
+sudo dnf update -y
+sudo dnf install -y git curl wget nodejs npm mysql
+```
+
+## 2. Install Docker
+
+```bash
+sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+sudo dnf install -y docker-ce docker-ce-cli containerd.io
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker $USER
+```
+
+Log out and back in for Docker permissions.
+
+## 3. Setup Project Directory
+
+```bash
+mkdir -p ~/ticket-booking-system
+cd ~/ticket-booking-system
+mkdir -p {user-service,event-service,booking-service,payment-service,frontend}
+mkdir -p k8s-manifests/{mysql,redis,rabbitmq,services,ingress}
+```
+
+## 4. Deploy MySQL Database
+
+```bash
+cd ~/ticket-booking-system/k8s-manifests/mysql
+```
+
+Create mysql-configmap.yaml:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  namespace: default
+data:
+  my.cnf: |
+    [mysqld]
+    default-authentication-plugin=mysql_native_password
+    bind-address = 0.0.0.0
+    innodb_buffer_pool_size = 512M
+    max_connections = 200
+```
+
+Create mysql-secret.yaml:
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: default
+type: Opaque
+data:
+  mysql-root-password: dGlja2V0Ym9va2luZ0AxMjM=
+  mysql-user: dGlja2V0dXNlcg==
+  mysql-password: dGlja2V0cGFzc3dvcmQ=
+  mysql-database: dGlja2V0X2Jvb2tpbmc=
+```
+
+Create mysql-init-configmap.yaml:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-initdb
+  namespace: default
+data:
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS ticket_booking;
+    USE ticket_booking;
+
+    CREATE TABLE users (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        first_name VARCHAR(100) NOT NULL,
+        last_name VARCHAR(100) NOT NULL,
+        phone VARCHAR(20),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        status ENUM('active', 'inactive') DEFAULT 'active',
+        INDEX idx_email (email)
+    );
+
+    CREATE TABLE events (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        venue VARCHAR(255) NOT NULL,
+        event_date DATETIME NOT NULL,
+        total_tickets INT NOT NULL,
+        available_tickets INT NOT NULL,
+        price DECIMAL(10,2) NOT NULL,
+        status ENUM('active', 'inactive', 'cancelled') DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_event_date (event_date)
+    );
+
+    CREATE TABLE bookings (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        user_id INT NOT NULL,
+        event_id INT NOT NULL,
+        ticket_count INT NOT NULL,
+        total_amount DECIMAL(10,2) NOT NULL,
+        status ENUM('pending', 'confirmed', 'cancelled', 'expired') DEFAULT 'pending',
+        booking_reference VARCHAR(50) UNIQUE,
+        payment_status ENUM('pending', 'completed', 'failed', 'refunded') DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP + INTERVAL 15 MINUTE),
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (event_id) REFERENCES events(id)
+    );
+
+    CREATE TABLE payments (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        booking_id INT NOT NULL,
+        amount DECIMAL(10,2) NOT NULL,
+        payment_method ENUM('credit_card', 'debit_card', 'paypal', 'bank_transfer') NOT NULL,
+        payment_gateway_id VARCHAR(255),
+        status ENUM('pending', 'completed', 'failed', 'refunded') DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (booking_id) REFERENCES bookings(id)
+    );
+
+    INSERT INTO events (title, description, venue, event_date, total_tickets, available_tickets, price) VALUES
+    ('Concert Night 2025', 'Amazing music concert with top artists', 'City Arena', '2025-12-15 19:00:00', 1000, 1000, 50.00),
+    ('Tech Conference', 'Latest trends in technology', 'Tech Center', '2025-11-20 09:00:00', 500, 500, 75.00),
+    ('Sports Championship', 'Annual sports tournament', 'Sports Complex', '2025-10-30 14:00:00', 2000, 2000, 30.00);
+```
+
+Create mysql-deployment.yaml:
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mysql-pv
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/data/mysql"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+spec:
+  storageClassName: manual
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - image: mysql:8.0
+        name: mysql
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-root-password
+        - name: MYSQL_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-database
+        - name: MYSQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-user
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-password
+        ports:
+        - containerPort: 3306
+        volumeMounts:
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+        - name: mysql-config
+          mountPath: /etc/mysql/conf.d
+        - name: mysql-initdb
+          mountPath: /docker-entrypoint-initdb.d
+      volumes:
+      - name: mysql-storage
+        persistentVolumeClaim:
+          claimName: mysql-pvc
+      - name: mysql-config
+        configMap:
+          name: mysql-config
+      - name: mysql-initdb
+        configMap:
+          name: mysql-initdb
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+spec:
+  ports:
+  - port: 3306
+    targetPort: 3306
+  selector:
+    app: mysql
+```
+
+Deploy MySQL:
+```bash
+sudo mkdir -p /data/mysql
+sudo chown 999:999 /data/mysql
+kubectl apply -f mysql-configmap.yaml
+kubectl apply -f mysql-secret.yaml
+kubectl apply -f mysql-init-configmap.yaml
+kubectl apply -f mysql-deployment.yaml
+kubectl wait --for=condition=available --timeout=300s deployment/mysql
+```
+
+## 5. Deploy Redis
+
+```bash
+cd ~/ticket-booking-system/k8s-manifests/redis
+```
+
+Create redis-deployment.yaml:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        command: ["redis-server"]
+        args: ["--appendonly", "yes"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+```
+
+```bash
+kubectl apply -f redis-deployment.yaml
+kubectl wait --for=condition=available --timeout=120s deployment/redis
+```
+
+## 6. Deploy RabbitMQ
+
+```bash
+cd ~/ticket-booking-system/k8s-manifests/rabbitmq
+```
+
+Create rabbitmq-deployment.yaml:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3.11-management
+        env:
+        - name: RABBITMQ_DEFAULT_USER
+          value: admin
+        - name: RABBITMQ_DEFAULT_PASS
+          value: password
+        ports:
+        - containerPort: 5672
+        - containerPort: 15672
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-service
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+  - port: 5672
+    targetPort: 5672
+  - port: 15672
+    targetPort: 15672
+```
+
+```bash
+kubectl apply -f rabbitmq-deployment.yaml
+kubectl wait --for=condition=available --timeout=120s deployment/rabbitmq
+```
+
+## 7. Build Microservices
+
+Create each service in its directory and build Docker images.
+
+User Service - Create src/app.js in user-service directory with Node.js code, then:
+```bash
+cd ~/ticket-booking-system/user-service
+docker build -t user-service:latest .
+docker save user-service:latest | sudo k3s ctr images import -
+```
+
+Event Service:
+```bash
+cd ~/ticket-booking-system/event-service
+docker build -t event-service:latest .
+docker save event-service:latest | sudo k3s ctr images import -
+```
+
+Booking Service:
+```bash
+cd ~/ticket-booking-system/booking-service
+docker build -t booking-service:latest .
+docker save booking-service:latest | sudo k3s ctr images import -
+```
+
+Payment Service:
+```bash
+cd ~/ticket-booking-system/payment-service
+docker build -t payment-service:latest .
+docker save payment-service:latest | sudo k3s ctr images import -
+```
+
+Frontend Service:
+```bash
+cd ~/ticket-booking-system/frontend
+docker build -t frontend-service:latest .
+docker save frontend-service:latest | sudo k3s ctr images import -
+```
+
+## 8. Deploy Services
+
+```bash
+cd ~/ticket-booking-system/k8s-manifests/services
+```
+
+Create user-service-deployment.yaml:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+    spec:
+      containers:
+      - name: user-service
+        image: user-service:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 3001
+        env:
+        - name: DB_HOST
+          value: mysql-service
+        - name: DB_USER
+          value: ticketuser
+        - name: DB_PASSWORD
+          value: ticketpassword
+        - name: DB_NAME
+          value: ticket_booking
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3001
+          initialDelaySeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 3001
+          initialDelaySeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+spec:
+  selector:
+    app: user-service
+  ports:
+  - port: 80
+    targetPort: 3001
+```
+
+Create similar deployments for event-service, booking-service, payment-service, and frontend-service.
+
+Deploy all services:
+```bash
+kubectl apply -f user-service-deployment.yaml
+kubectl apply -f event-service-deployment.yaml
+kubectl apply -f booking-service-deployment.yaml
+kubectl apply -f payment-service-deployment.yaml
+kubectl apply -f frontend-service-deployment.yaml
+```
+
+## 9. Setup Ingress
+
+```bash
+cd ~/ticket-booking-system/k8s-manifests/ingress
+```
+
+Create traefik-ingress.yaml:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ticket-booking-ingress
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /api/register
+        pathType: Prefix
+        backend:
+          service:
+            name: user-service
+            port:
+              number: 80
+      - path: /api/login
+        pathType: Prefix
+        backend:
+          service:
+            name: user-service
+            port:
+              number: 80
+      - path: /api/events
+        pathType: Prefix
+        backend:
+          service:
+            name: event-service
+            port:
+              number: 80
+      - path: /api/bookings
+        pathType: Prefix
+        backend:
+          service:
+            name: booking-service
+            port:
+              number: 80
+      - path: /api/payments
+        pathType: Prefix
+        backend:
+          service:
+            name: payment-service
+            port:
+              number: 80
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service
+            port:
+              number: 80
+```
+
+```bash
+kubectl apply -f traefik-ingress.yaml
+```
+
+## 10. Configure Auto-scaling
+
+Create hpa.yaml:
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: user-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: user-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: booking-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: booking-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+```
+
+```bash
+kubectl apply -f hpa.yaml
+```
+
+## 11. Verify Deployment
+
+```bash
+kubectl get pods
+kubectl get svc
+kubectl get ingress
+kubectl get hpa
+```
+
+## 12. Test Application
+
+```bash
+# Get server IP
+PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+# Test registration
+curl -X POST http://$PUBLIC_IP/api/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@test.com","password":"test123","firstName":"Test","lastName":"User"}'
+
+# Test events
+curl http://$PUBLIC_IP/api/events
+
+# Access web interface
+echo "Open browser to: http://$PUBLIC_IP"
+```
+
+## 13. Troubleshooting
+
+Check pod logs:
+```bash
+kubectl logs -f deployment/user-service
+```
+
+Check pod status:
+```bash
+kubectl describe pod <pod-name>
+```
+
+Check service endpoints:
+```bash
+kubectl get endpoints
+```
+
+Port forward for debugging:
+```bash
+kubectl port-forward svc/user-service 3001:80
+```
+
+The application will be accessible at your server's public IP address.
